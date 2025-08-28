@@ -1,0 +1,42 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+      {
+          "Sid": "DesignAnalysisS3Access",
+          "Effect": "Allow",
+          "Action": [
+              "s3:GetObject",
+              "s3:PutObject",
+              "s3:DeleteObject",
+              "s3:ListBucket"
+          ],
+          "Resource": [
+              "arn:aws:s3:::design-analysis-2025",
+              "arn:aws:s3:::design-analysis-2025/*"
+          ]
+      },
+      {
+          "Sid": "DesignAnalysisS3ListBucketsAccess",
+          "Effect": "Allow",
+          "Action": [
+              "s3:ListAllMyBuckets"
+          ],
+          "Resource": "*"
+      },
+      {
+          "Sid": "DesignAnalysisCloudWatchLogs",
+          "Effect": "Allow",
+          "Action": [
+              "logs:CreateLogGroup",
+              "logs:CreateLogStream",
+              "logs:PutLogEvents",
+              "logs:DescribeLogGroups",
+              "logs:DescribeLogStreams"
+          ],
+          "Resource": [
+              "arn:aws:logs:*:*:log-group:/aws/design-analysis/*",
+              "arn:aws:logs:*:*:log-group:/aws/design-analysis/*:log-stream:*"
+          ]
+      }
+  ]
+}
