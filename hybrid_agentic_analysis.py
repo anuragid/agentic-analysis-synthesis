@@ -16,8 +16,15 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 import uuid
 
+from dynamodb_tracker import DynamoDBTracker
+from s3_storage import create_s3_storage
+
 # Configure logging
 logger = logging.getLogger(__name__)
+
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_PREFIX = os.getenv("S3_PREFIX", "design-analysis")
 
 # Import DynamoDB tracker
 try:
@@ -50,11 +57,42 @@ if DYNAMODB_AVAILABLE:
         print(f"⚠️ Failed to initialize DynamoDB tracker: {e}")
         tracker = None
 
+
+# Initialize storage
+def initialize_storage():
+    storage = create_s3_storage(
+        bucket_name=S3_BUCKET_NAME,
+        region=S3_REGION,
+        prefix=S3_PREFIX
+    )
+    return storage
+
+
+# Initialize storage
+storage = initialize_storage()
+
 # State definition for LangGraph
+
+
+class ProjectConfig(BaseModel):
+    project_name: str = Field(description="Project name")
+    project_id: str = Field(description="Project ID")
+    # s3://aas/projects/<project_id>/<latest_result_id>.json
+    result_path: str = Field(description="Project Result path")
+
+
+class InputConfig(BaseModel):
+    project_name: str = Field(description="Project name")
 
 
 class DesignAnalysisState(TypedDict):
     """State for the design analysis workflow"""
+    tracker: DynamoDBTracker
+    input_config: InputConfig
+    project_config: ProjectConfig
+    project_result: Optional[dict] = Field(
+        description="Project's result")
+    combine_phase: bool = Field(description="Combine phase", default=False)
     research_data: str
     chunks: List[Dict[str, Any]]
     inferences: List[Dict[str, Any]]
@@ -261,6 +299,30 @@ def get_design_principle_functions():
 
 def chunk_research_data(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 1: Break research data into chunks using LangChain output parser"""
+    project_id = state.get('project_config', {}).get('project_id')
+    # check if combine
+    is_combine_phase = state.get('combine_phase', False)
+    if is_combine_phase:
+        latest_project_result = state.get('latest_project_result')
+        if latest_project_result:
+            if tracker and request_id:
+                tracker.update_project_step_status(
+                    project_id=project_id,
+                    request_id=request_id,
+                    step_name="chunking",
+                    status=StepStatus.COMPLETED,
+                    message=f"Successfully created {len(latest_project_result.get('chunks', [])) + len(state.get('chunks', []))} chunks using latest project result and current chunks",
+                )
+            return {
+                **state,
+                "chunks": [
+                    *[chunk for chunk in latest_project_result.get('chunks', [])],
+                    *[chunk for chunk in state.get('chunks', [])]
+                ],
+                "current_step": "chunking",
+                "messages": state["messages"] + [AIMessage(content=f"Created {len(latest_project_result.get('chunks', [])) + len(state.get('chunks', []))} chunks using latest project result and current chunks")]
+            }
+        return state
 
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
@@ -268,6 +330,13 @@ def chunk_research_data(state: DesignAnalysisState) -> DesignAnalysisState:
         tracker.update_step_status(
             request_id, "chunking", StepStatus.PROCESSING,
             "Starting to chunk research data"
+        )
+        tracker.update_project_step_status(
+            project_id=project_id,
+            request_id=request_id,
+            step_name="chunking",
+            status=StepStatus.PROCESSING,
+            message="Starting to chunk research data",
         )
 
     # Create output parser for chunks
@@ -352,7 +421,13 @@ Return a JSON array of chunks."""
                 request_id, "chunking", StepStatus.COMPLETED,
                 f"Successfully created {len(chunks)} chunks"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="chunking",
+                status=StepStatus.COMPLETED,
+                message=f"Created {len(chunks)} chunks using fallback method",
+            )
     except Exception as e:
         # Fallback to rule-based chunking if parsing fails
         print(f"Parsing failed, using fallback: {e}")
@@ -379,6 +454,13 @@ Return a JSON array of chunks."""
                 request_id, "chunking", StepStatus.COMPLETED,
                 f"Created {len(chunks)} chunks using fallback method"
             )
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="chunking",
+                status=StepStatus.COMPLETED,
+                message=f"Created {len(chunks)} chunks using fallback method",
+            )
 
     return {
         **state,
@@ -390,6 +472,30 @@ Return a JSON array of chunks."""
 
 def infer_meanings(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 2: Interpret chunks and extract meanings using LangChain output parser"""
+    project_id = state.get('project_config', {}).get('project_id')
+    # check if combine
+    is_combine_phase = state.get('combine_phase', False)
+    if is_combine_phase:
+        latest_project_result = state.get('latest_project_result')
+        if latest_project_result:
+            if tracker and request_id:
+                tracker.update_project_step_status(
+                    project_id=project_id,
+                    request_id=request_id,
+                    step_name="inferring",
+                    status=StepStatus.COMPLETED,
+                    message=f"Successfully created {len(latest_project_result.get('inferences', [])) + len(state.get('inferences', []))} inferences using latest project result and current inferences",
+                )
+            return {
+                **state,
+                "inferences": [
+                    *[inference for inference in latest_project_result.get('inferences', [])],
+                    *[inference for inference in state.get('inferences', [])]
+                ],
+                "current_step": "inferring",
+                "messages": state["messages"] + [AIMessage(content=f"Created {len(latest_project_result.get('inferences', []))} inferences using latest project result")]
+            }
+        return state
 
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
@@ -397,6 +503,13 @@ def infer_meanings(state: DesignAnalysisState) -> DesignAnalysisState:
         tracker.update_step_status(
             request_id, "inferring", StepStatus.PROCESSING,
             "Starting to infer meanings from chunks"
+        )
+        tracker.update_project_step_status(
+            project_id=project_id,
+            request_id=request_id,
+            step_name="inferring",
+            status=StepStatus.PROCESSING,
+            message="Starting to infer meanings from chunks",
         )
 
     # Create output parser for inferences
@@ -447,6 +560,13 @@ Return a JSON array of inferences."""
                 request_id, "inferring", StepStatus.COMPLETED,
                 f"Successfully generated {len(inferences)} inferences"
             )
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="inferring",
+                status=StepStatus.COMPLETED,
+                message=f"Generated {len(inferences)} inferences",
+            )
 
     except Exception as e:
         # Fallback to rule-based inference if parsing fails
@@ -481,7 +601,13 @@ Return a JSON array of inferences."""
                 request_id, "inferring", StepStatus.COMPLETED,
                 f"Generated {len(inferences)} inferences using fallback method"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="inferring",
+                status=StepStatus.COMPLETED,
+                message=f"Generated {len(inferences)} inferences using fallback method",
+            )
     return {
         **state,
         "inferences": inferences,
@@ -492,13 +618,20 @@ Return a JSON array of inferences."""
 
 def relate_patterns(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 3: Find patterns across meanings using LangChain output parser"""
-
+    project_id = state.get('project_config', {}).get('project_id')
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
         tracker.update_step_status(
             request_id, "relating", StepStatus.PROCESSING,
             "Starting to identify patterns across meanings"
+        )
+        tracker.update_project_step_status(
+            project_id=project_id,
+            request_id=request_id,
+            step_name="relating",
+            status=StepStatus.PROCESSING,
+            message="Starting to identify patterns across meanings",
         )
 
     # Create output parser for patterns
@@ -549,7 +682,13 @@ Return a JSON array of patterns."""
                 request_id, "relating", StepStatus.COMPLETED,
                 f"Successfully identified {len(patterns)} patterns"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="relating",
+                status=StepStatus.COMPLETED,
+                message=f"Successfully identified {len(patterns)} patterns",
+            )
     except Exception as e:
         # Fallback to rule-based pattern detection if parsing fails
         print(f"Parsing failed, using fallback: {e}")
@@ -591,7 +730,13 @@ Return a JSON array of patterns."""
                 request_id, "relating", StepStatus.COMPLETED,
                 f"Identified {len(patterns)} patterns using fallback method"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="relating",
+                status=StepStatus.COMPLETED,
+                message=f"Identified {len(patterns)} patterns using fallback method",
+            )
     return {
         **state,
         "patterns": patterns,
@@ -602,7 +747,7 @@ Return a JSON array of patterns."""
 
 def explain_insights(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 4: Generate insights from patterns using LangChain output parser"""
-
+    project_id = state.get('project_config', {}).get('project_id')
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
@@ -610,7 +755,13 @@ def explain_insights(state: DesignAnalysisState) -> DesignAnalysisState:
             request_id, "explaining", StepStatus.PROCESSING,
             "Starting to generate insights from patterns"
         )
-
+        tracker.update_project_step_status(
+            project_id=project_id,
+            request_id=request_id,
+            step_name="explaining",
+            status=StepStatus.PROCESSING,
+            message="Starting to generate insights from patterns",
+        )
     # Create output parser for insights
     insight_parser = JsonOutputParser(pydantic_object=Insight)
 
@@ -662,7 +813,13 @@ Return a JSON array of insights."""
                 request_id, "explaining", StepStatus.COMPLETED,
                 f"Successfully generated {len(insights)} insights"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="explaining",
+                status=StepStatus.COMPLETED,
+                message=f"Successfully generated {len(insights)} insights",
+            )
     except Exception as e:
         # Fallback to rule-based insight generation if parsing fails
         print(f"Parsing failed, using fallback: {e}")
@@ -695,7 +852,13 @@ Return a JSON array of insights."""
                 request_id, "explaining", StepStatus.COMPLETED,
                 f"Generated {len(insights)} insights using fallback method"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="explaining",
+                status=StepStatus.COMPLETED,
+                message=f"Generated {len(insights)} insights using fallback method",
+            )
     return {
         **state,
         "insights": insights,
@@ -706,13 +869,20 @@ Return a JSON array of insights."""
 
 def activate_design_principles(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 5: Convert insights into design principles using LangChain output parser"""
-
+    project_id = state.get('project_config', {}).get('project_id')
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
         tracker.update_step_status(
             request_id, "activating", StepStatus.PROCESSING,
             "Starting to create design principles from insights"
+        )
+        tracker.update_project_step_status(
+            project_id=project_id,
+            request_id=request_id,
+            step_name="activating",
+            status=StepStatus.PROCESSING,
+            message="Starting to create design principles from insights",
         )
 
     # Create output parser for design principles
@@ -763,7 +933,13 @@ Return a JSON array of design principles."""
                 request_id, "activating", StepStatus.COMPLETED,
                 f"Successfully created {len(design_principles)} design principles"
             )
-
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="activating",
+                status=StepStatus.COMPLETED,
+                message=f"Created {len(design_principles)} design principles using fallback method",
+            )
     except Exception as e:
         # Fallback to rule-based design principle generation if parsing fails
         print(f"Parsing failed, using fallback: {e}")
@@ -793,6 +969,13 @@ Return a JSON array of design principles."""
             tracker.update_step_status(
                 request_id, "activating", StepStatus.COMPLETED,
                 f"Created {len(design_principles)} design principles using fallback method"
+            )
+            tracker.update_project_step_status(
+                project_id=project_id,
+                request_id=request_id,
+                step_name="activating",
+                status=StepStatus.COMPLETED,
+                message=f"Created {len(design_principles)} design principles using fallback method",
             )
 
     return {
@@ -829,11 +1012,31 @@ def create_hybrid_agentic_graph():
     return workflow.compile()
 
 
-def run_hybrid_agentic_analysis(research_data: str, request_id: Optional[str] = None, research_data_s3_path: Optional[str] = None, save_to_s3: bool = True) -> Dict[str, Any]:
+def initialize_project_config_in_graph(tracker: DynamoDBTracker, project_name: str) -> ProjectConfig:
+
+    # query dynamo db for project config by project name
+    project_config = tracker.get_project_config_by_name(project_name)
+
+    if not project_config:
+        # create new project config
+        tracker.create_project_config(project_name)
+        project_config = tracker.get_project_config_by_name(project_name)
+
+    return ProjectConfig(**project_config)
+
+
+def run_hybrid_agentic_analysis(
+        research_data: str,
+        project_name: str,
+        request_id: Optional[str] = None,
+        research_data_s3_path: Optional[str] = None,
+        save_to_s3: bool = True):
     """Run the complete hybrid agentic design analysis workflow"""
 
     # Create the LangGraph workflow
     graph = create_hybrid_agentic_graph()
+
+    project_config = initialize_project_config_in_graph(tracker, project_name)
 
     # Generate request ID if not provided
     if not request_id:
@@ -841,10 +1044,23 @@ def run_hybrid_agentic_analysis(research_data: str, request_id: Optional[str] = 
 
     # Initialize DynamoDB tracking if available
     if tracker and research_data_s3_path:
-        tracker.create_analysis_request(request_id, research_data_s3_path)
+        tracker.create_analysis_request(
+            request_id,
+            project_id=project_config.project_id,
+            research_data_s3_path=research_data_s3_path
+        )
+        tracker.create_project_analysis_request(
+            request_id,
+            project_id=project_config.project_id,
+        )
 
     # Initialize state
     initial_state = {
+        "tracker": tracker,
+        "project_config": project_config,
+        "input_config": InputConfig(project_name=project_name),
+        "project_result": None,
+        "combine_phase": False,
         "research_data": research_data,
         "chunks": [],
         "inferences": [],
@@ -865,28 +1081,36 @@ def run_hybrid_agentic_analysis(research_data: str, request_id: Optional[str] = 
 
     # Run the workflow
     result = graph.invoke(initial_state)
+    combined_result = result
+
+    # invoke with combined
+    if project_config.result_path:
+        project_result = storage.get_project_result(
+            project_config.result_path)
+        if project_result:
+            initial_state['combine_phase'] = True
+            initial_state['project_result'] = project_result
+            combined_result = graph.invoke(initial_state)
+        else:
+            logger.error(
+                f"❌ Failed to get project result from S3: {project_config.result_path}")
+            return None
 
     # Save result to S3 and update DynamoDB result_data field
     if tracker and request_id and save_to_s3:
         try:
-            # Import storage functionality
-            from s3_storage import create_s3_storage
-            # Create S3 storage instance
-            storage = create_s3_storage()
-            # Get the actual S3 path where the result was stored using storage system
-            result_s3_path = storage._get_object_key(request_id, "analysis")
             # Save result to S3
-            success = storage.save_analysis(request_id, result)
+            success = storage.save_project_result(
+                request_id, project_config.result_path, result, combined_result)
             if success:
-                logger.info(f"✅ Analysis result saved to S3: {result_s3_path}")
-                # Update DynamoDB with the result S3 path (only the result_data field)
-                tracker.update_result_data(request_id, result_s3_path)
+                logger.info(
+                    f"✅ Project result saved to S3: {project_config.result_path}")
             else:
-                logger.warning(f"⚠️ Failed to save analysis result to S3")
+                logger.error(f"❌ Failed to save project result to S3")
         except Exception as e:
-            logger.error(f"❌ Error saving result to S3: {e}")
+            logger.error(f"❌ Error saving project result to S3: {e}")
 
-    return result
+    return combined_result
 
 
 if __name__ == "__main__":

@@ -779,8 +779,72 @@ class S3Storage:
             logger.error(f"Failed to get bucket info: {e}")
             return {"error": str(e)}
 
+    def get_project_result(self, project_result_path: str) -> Optional[dict]:
+        """Get the project result from S3"""
+        try:
+            # Get the project result from S3
+            response = self.s3_client.get_object(
+                Bucket=self.bucket_name,
+                Key=f"{project_result_path}/combined_result.json"
+            )
+            result = json.loads(response['Body'].read().decode('utf-8'))
+            return result
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NoSuchKey':
+                logger.error(f"File not found in S3: {project_result_path}")
+            else:
+                logger.error(f"Failed to get project result: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to get project result: {e}")
+            return None
+
+    def save_project_result(self, request_id: str, project_result_path: str, result: dict, combined_result: dict) -> bool:
+        """Save the project result to S3"""
+        try:
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=f"{project_result_path}/{request_id}.json",
+                Body=json.dumps(result).encode('utf-8'),
+                ContentType='application/json',
+                Metadata={
+                    'request_id': request_id,
+                    'implementation': result.get('implementation', 'unknown'),
+                    'status': result.get('status', 'unknown'),
+                    'timestamp': result.get('timestamp', ''),
+                    'file_type': 'analysis'
+                }
+            )
+
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=f"{project_result_path}/combined_result.json",
+                Body=json.dumps(combined_result).encode('utf-8'),
+                ContentType='application/json',
+                Metadata={
+                    'request_id': request_id,
+                    'implementation': combined_result.get('implementation', 'unknown'),
+                    'status': combined_result.get('status', 'unknown'),
+                    'timestamp': combined_result.get('timestamp', ''),
+                    'file_type': 'combined_result'
+                }
+            )
+            return True
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NoSuchKey':
+                logger.error(f"File not found in S3: {project_result_path}")
+            else:
+                logger.error(f"Failed to save project result: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to save project result: {e}")
+            return False
 
 # Factory function for easy initialization
+
+
 def create_s3_storage(
     bucket_name: str,
     region: str,

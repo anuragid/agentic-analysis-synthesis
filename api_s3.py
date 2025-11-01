@@ -6,7 +6,7 @@ FastAPI application with configurable storage (local or S3) and DynamoDB trackin
 
 from dynamodb_tracker import StepStatus
 from s3_storage import create_s3_storage, S3Storage
-from agentic_analysis import run_agentic_analysis
+from agentic_analysis import ProjectConfig, run_agentic_analysis
 from hybrid_agentic_analysis import run_hybrid_agentic_analysis
 from openai_agentic_analysis import run_openai_agentic_analysis
 
@@ -304,6 +304,7 @@ storage = initialize_storage()
 
 # Pydantic models
 class AnalysisRequest(BaseModel):
+    project_name: str = Field(description="Project name")
     research_data: Optional[str] = Field(
         None, description="Research data to analyze (for small data)")
     s3_file_path: Optional[str] = Field(
@@ -313,7 +314,7 @@ class AnalysisRequest(BaseModel):
     include_metadata: bool = Field(
         default=True, description="Include analysis metadata in response")
 
-    @field_validator('research_data', 's3_file_path')
+    @field_validator('research_data', 's3_file_path', 'project_name')
     @classmethod
     def validate_input(cls, v, info):
         """Ensure either research_data or s3_file_path is provided, but not both"""
@@ -492,6 +493,19 @@ async def analyze_research_data(request: AnalysisRequest):
 
     # Generate request ID
     request_id = str(uuid.uuid4())
+    project_config = tracker.get_project_config_by_name(
+        request.project_name) if tracker else None
+    if not project_config:
+        tracker.create_project_config(
+            request.project_name) if tracker else None
+        project_config = tracker.get_project_config_by_name(
+            request.project_name) if tracker else None
+    if not project_config:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create project. Please try again."
+        )
+    project_config = ProjectConfig(**project_config)
     logger.info(f"🚀 New analysis request received: {request_id}")
     logger.info(
         f"📋 Request details - Implementation: {request.implementation}, Include metadata: {request.include_metadata}")
@@ -628,7 +642,8 @@ async def analyze_research_data(request: AnalysisRequest):
                 research_data,
                 request.implementation,
                 research_data_s3_path,
-                request.include_metadata
+                request.include_metadata,
+                project_config
             )
         )
 
@@ -651,7 +666,7 @@ async def analyze_research_data(request: AnalysisRequest):
         )
 
 
-async def run_analysis_async(request_id: str, research_data: str, implementation: str, research_data_s3_path: str, include_metadata: bool):
+async def run_analysis_async(request_id: str, research_data: str, implementation: str, research_data_s3_path: str, include_metadata: bool, project_config: ProjectConfig):
     """Run analysis asynchronously in the background"""
 
     logger.info(f"🔄 Starting background analysis for request {request_id}")
@@ -715,6 +730,8 @@ async def run_analysis_async(request_id: str, research_data: str, implementation
 
                     # Update DynamoDB with the result S3 path (only the result_data field)
                     tracker.update_result_data(request_id, result_s3_path)
+                    tracker.update_project_result_data(
+                        project_config.project_id, project_config.latest_result_path)
                     logger.info(
                         f"✅ DynamoDB updated with result S3 path: {result_s3_path}")
                 except Exception as e:

@@ -843,8 +843,7 @@ def display_analysis_results(results=None, steps_status=None, is_realtime=False)
         else:
             # Final results display
             if results and 'chunks' in results and results['chunks']:
-                # Show first 10
-                for i, chunk in enumerate(results['chunks'][:10]):
+                for i, chunk in enumerate(results['chunks'][:]):
                     with st.expander(f"Chunk {i+1}"):
                         st.write(f"**Content:** {chunk.get('content', '')}")
                         st.write(f"**ID:** {chunk.get('id', '')}")
