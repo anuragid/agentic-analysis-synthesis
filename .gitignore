@@ -9,3 +9,10 @@ __pycache__
 *.pywz
 *.pyz
 .env
+
+# Flutter/FVM
+*/.fvm/flutter_sdk
+*/.fvm/.flutter-plugins
+*/.fvm/.flutter-plugins-dependencies
+*/.fvm/.packages
+*/.fvm/pubspec.lock

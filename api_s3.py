@@ -7,7 +7,7 @@ FastAPI application with configurable storage (local or S3) and DynamoDB trackin
 from dynamodb_tracker import StepStatus
 from s3_storage import create_s3_storage, S3Storage
 from agentic_analysis import run_agentic_analysis
-from hybrid_agentic_analysis import ProjectConfig, run_hybrid_agentic_analysis
+from hybrid_agentic_analysis import HybridAnalysisResponse, ProjectConfig, run_hybrid_agentic_analysis
 from openai_agentic_analysis import run_openai_agentic_analysis
 
 # Import DynamoDB tracker
@@ -760,18 +760,16 @@ async def run_analysis_async(request_id: str, research_data: str, implementation
         storage.save_analysis(request_id, error_response.dict())
 
 
-@app.get("/analyze/{request_id}", response_model=AnalysisResponse)
+@app.get("/analyze/{request_id}", response_model=HybridAnalysisResponse)
 async def get_analysis_result(request_id: str):
     """Get analysis result by request ID"""
-    result = storage.load_analysis(request_id)
-
+    result = tracker.get_project_result_by_request_id(request_id)
     if not result:
         raise HTTPException(
             status_code=404,
             detail=f"Analysis with ID {request_id} not found"
         )
-
-    return AnalysisResponse(**result)
+    return HybridAnalysisResponse(**result)
 
 
 @app.delete("/analyze/{request_id}")
@@ -1083,6 +1081,161 @@ async def get_storage_info():
         "storage_info": storage_info,
         "stats": storage.get_storage_stats()
     }
+
+
+# Project management endpoints
+class ProjectCreateRequest(BaseModel):
+    project_name: str = Field(..., description="Name of the project")
+
+
+class ProjectResponse(BaseModel):
+    project_id: str
+    project_name: str
+    result_path: str
+    latest_request_id: str
+    created_at: Optional[str] = None
+
+
+@app.get("/projects", response_model=List[ProjectResponse])
+async def list_projects():
+    """List all projects"""
+    if not tracker:
+        raise HTTPException(
+            status_code=503,
+            detail="DynamoDB tracking not available"
+        )
+
+    try:
+        # Scan the project config table to get all projects
+        response = tracker.dynamodb.scan(
+            TableName=tracker.project_config_table_name
+        )
+
+        projects = []
+        for item in response.get('Items', []):
+            project_dict = tracker._dynamodb_to_dict(item)
+            projects.append(ProjectResponse(
+                project_id=project_dict.get('project_id', ''),
+                project_name=project_dict.get('project_name', ''),
+                result_path=project_dict.get('result_path', ''),
+                latest_request_id=project_dict.get('latest_request_id', ''),
+                created_at=project_dict.get('created_at')
+            ))
+
+        return projects
+    except Exception as e:
+        logger.error(f"❌ Failed to list projects: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to list projects: {str(e)}"
+        )
+
+
+@app.post("/projects", response_model=ProjectResponse)
+async def create_project(request: ProjectCreateRequest):
+    """Create a new project"""
+    if not tracker:
+        raise HTTPException(
+            status_code=503,
+            detail="DynamoDB tracking not available"
+        )
+
+    try:
+        # Check if project already exists
+        existing_project = tracker.get_project_config_by_name(
+            request.project_name)
+        if existing_project:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Project with name '{request.project_name}' already exists"
+            )
+
+        # Create project
+        success = tracker.create_project_config(request.project_name)
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create project"
+            )
+
+        # Get the created project
+        project_config = tracker.get_project_config_by_name(
+            request.project_name)
+        if not project_config:
+            raise HTTPException(
+                status_code=500,
+                detail="Project created but could not be retrieved"
+            )
+
+        return ProjectResponse(
+            project_id=project_config.get('project_id', ''),
+            project_name=project_config.get('project_name', ''),
+            result_path=project_config.get('result_path', ''),
+            latest_request_id=project_config.get('latest_request_id', ''),
+            created_at=datetime.now().isoformat()
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to create project: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create project: {str(e)}"
+        )
+
+
+@app.get("/projects/{project_id}/latest-result", response_model=HybridAnalysisResponse)
+async def get_project_latest_result(project_id: str):
+    """Get the latest analysis result for a project"""
+    if not tracker:
+        raise HTTPException(
+            status_code=503,
+            detail="DynamoDB tracking not available"
+        )
+
+    try:
+        # Find project by project_id
+        response = tracker.dynamodb.scan(
+            TableName=tracker.project_config_table_name,
+            FilterExpression='project_id = :project_id',
+            ExpressionAttributeValues={
+                ':project_id': {'S': project_id}
+            }
+        )
+
+        if not response.get('Items'):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Project with ID {project_id} not found"
+            )
+
+        project_config = tracker._dynamodb_to_dict(response['Items'][0])
+        latest_request_id = project_config.get('latest_request_id', '')
+
+        if not latest_request_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No analysis results found for project {project_id}"
+            )
+
+        # Get the analysis result
+        result = tracker.get_project_result_by_request_id(
+            f"combined_{latest_request_id}")
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Analysis result {latest_request_id} not found"
+            )
+
+        return HybridAnalysisResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to get project latest result: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to get project latest result: {str(e)}"
+        )
 
 
 def parse_arguments():
