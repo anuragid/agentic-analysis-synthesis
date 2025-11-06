@@ -11,10 +11,13 @@ from datetime import timezone
 import uuid
 import boto3
 from datetime import datetime
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, TYPE_CHECKING
 from enum import Enum
 from botocore.exceptions import ClientError, NoCredentialsError
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from hybrid_agentic_analysis import HybridAnalysisResponse
 
 # Load environment variables
 load_dotenv()
@@ -42,14 +45,16 @@ class StepStatus(Enum):
 class DynamoDBTracker:
     """DynamoDB tracker for analysis step status"""
 
-    def __init__(self, table_name: Optional[str] = None, project_table_name: Optional[str] = None, project_config_table_name: Optional[str] = None):
+    def __init__(self, table_name: Optional[str] = None, project_table_name: Optional[str] = None, project_config_table_name: Optional[str] = None, project_result_table_name: Optional[str] = None):
         """Initialize DynamoDB tracker"""
         self.table_name = table_name or os.getenv(
-            "DYNAMODB_TABLE_NAME", "design-analysis-tracking")
+            "DYNAMODB_TABLE_NAME", "aas")
         self.project_config_table_name = project_config_table_name or os.getenv(
-            "DYNAMODB_PROJECT_CONFIG_TABLE_NAME", "design-analysis-project-config")
+            "DYNAMODB_PROJECT_CONFIG_TABLE_NAME", "aas-project-config")
         self.project_table_name = project_table_name or os.getenv(
-            "DYNAMODB_PROJECT_TABLE_NAME", "design-analysis-project-tracking")
+            "DYNAMODB_PROJECT_TABLE_NAME", "aas-project-tracking")
+        self.project_result_table_name = project_result_table_name or os.getenv(
+            "DYNAMODB_PROJECT_RESULT_TABLE_NAME", "aas-project-results")
         self.region = os.getenv("AWS_REGION", "us-east-1")
 
         # Initialize DynamoDB client
@@ -64,10 +69,12 @@ class DynamoDBTracker:
     def get_project_config_by_name(self, project_name: str) -> Optional[Dict[str, Any]]:
         """Get project config by project name"""
         try:
+            logger.info(f"project name: {project_name}")
             response = self.dynamodb.get_item(
                 TableName=self.project_config_table_name,
                 Key={'project_name': {'S': project_name}}
             )
+            logger.info(f"Project config response: {response}")
             if 'Item' in response:
                 return self._dynamodb_to_dict(response['Item'])
             else:
@@ -85,25 +92,42 @@ class DynamoDBTracker:
                 Item={
                     'project_name': {'S': project_name},
                     'project_id': {'S': project_id},
-                    'latest_result_path': {'S': ''}
+                    'result_path': {'S': ''},
+                    'latest_request_id': {'S': ''}
                 }
             )
             return True
         except Exception as e:
             raise Exception(f"Failed to create project config: {e}")
 
-    def update_project_config(self, project_name: str, project_config: Dict[str, Any]) -> bool:
+    def get_project_result_by_request_id(self, request_id: str) -> Optional[Dict[str, Any]]:
+        """Get project result by request id"""
+        try:
+            response = self.dynamodb.get_item(
+                TableName=self.project_result_table_name,
+                Key={'request_id': {'S': request_id}}
+            )
+            logger.info(f"Project result response: {response['Item']}")
+            return self._dynamodb_to_dict(response['Item'])
+        except Exception as e:
+            logger.error(f"Failed to get project result by request id: {e}")
+            raise Exception(f"Failed to get project result by request id: {e}")
+
+    def update_project_config(self, request_id: str, project_name: str, project_config: Dict[str, Any]) -> bool:
         """Update a project config"""
         try:
             response = self.dynamodb.update_item(
                 TableName=self.project_config_table_name,
                 Key={'project_name': {'S': project_name}},
-                # update latest_result_path
-                UpdateExpression='SET #latest_result_path = :latest_result_path',
+                # update result_path
+                UpdateExpression='SET #result_path = :result_path, #latest_request_id = :latest_request_id',
                 ExpressionAttributeNames={
-                    '#latest_result_path': 'latest_result_path'},
+                    '#result_path': 'result_path',
+                    '#latest_request_id': 'latest_request_id'
+                },
                 ExpressionAttributeValues={
-                    ':latest_result_path': {'S': project_config.get('latest_result_path', '')}
+                    ':result_path': {'S': project_config.get('result_path', '')},
+                    ':latest_request_id': {'S': request_id}
                 }
             )
 
@@ -121,7 +145,7 @@ class DynamoDBTracker:
 
             # Build client configuration
             client_kwargs = {
-                'region_name': self.region
+                'region_name': "us-east-2"
             }
 
             # Only add explicit credentials if they are provided
@@ -162,13 +186,18 @@ class DynamoDBTracker:
             self.dynamodb.describe_table(TableName=self.table_name)
             logger.info(f"Using existing DynamoDB table: {self.table_name}")
 
+            self.dynamodb.describe_table(
+                TableName=self.project_config_table_name)
+            logger.info(
+                f"Using existing DynamoDB table: {self.project_config_table_name}")
+
+            self.dynamodb.describe_table(TableName=self.project_table_name)
+            logger.info(
+                f"Using existing DynamoDB table: {self.project_table_name}")
+
         except ClientError as e:
             error_code = e.response['Error']['Code']
-            if error_code == 'ResourceNotFoundException':
-                # Table doesn't exist, create it
-                self._create_table()
-            else:
-                raise Exception(f"Error checking DynamoDB table: {e}")
+            raise Exception(f"Error checking DynamoDB table: {e}")
 
     def _create_table(self):
         """Create DynamoDB table with proper configuration"""
@@ -357,10 +386,7 @@ class DynamoDBTracker:
                 'combined_analysis_result': {
                     'M': {
                         'result_data': {'S': ''},
-                        'steps_status': {
-                            'result_data': {'S': ''},
-                            'steps_status': {'M': step_status}
-                        }
+                        'steps_status': {'M': step_status}
                     }
                 },
                 'created_at': {'S': datetime.now(timezone.utc).isoformat()},
@@ -493,11 +519,11 @@ class DynamoDBTracker:
             # Update step status - use proper nested path
             step_path = f"#combined_analysis_result.#steps_status.#{step_name}.#status"
             message_path = f"#combined_analysis_result.#steps_status.#{step_name}.#message"
-            request_id_path = f"#request_id = :request_id"
+            request_id_path = f"#request_id"
 
             update_expression += f"{step_path} = :status, "
             update_expression += f"{message_path} = :message, "
-            update_expression += f"{request_id_path} = :request_id"
+            update_expression += f"{request_id_path} = :request_id, "
 
             expression_attribute_names.update({
                 '#combined_analysis_result': 'combined_analysis_result',
@@ -530,6 +556,7 @@ class DynamoDBTracker:
 
             # Update overall status and result data if analysis is complete
             if step_name == "activating" and status == StepStatus.COMPLETED:
+                update_expression += "#overall_status = :overall_status, "
                 update_expression += "#combined_analysis_result.#result_data = :result_data, "
                 update_expression += "#updated_at = :timestamp"
 
@@ -607,7 +634,7 @@ class DynamoDBTracker:
             logger.error(f"❌ Failed to update result data: {e}")
             return False
 
-    def update_project_result_data(self, project_id: str, result_s3_path: str) -> bool:
+    def update_project_result_data(self, request_id: str, project_name: str, project_id: str, result_s3_path: str, step_result: "HybridAnalysisResponse", combined_result: "HybridAnalysisResponse") -> bool:
         """Update the result data of a project"""
         try:
             logger.info(
@@ -616,16 +643,16 @@ class DynamoDBTracker:
             timestamp = datetime.now(timezone.utc).isoformat()
 
             # Update only the result_data field
-            update_expression = "SET #project_result.#result_data = :result_data, #updated_at = :timestamp"
+            update_expression = "SET #combined_analysis_result.#result_data = :result_data, #updated_at = :timestamp"
 
             expression_attribute_names = {
-                '#project_result': 'project_result',
+                '#combined_analysis_result': 'combined_analysis_result',
                 '#result_data': 'result_data',
                 '#updated_at': 'updated_at'
             }
 
             expression_attribute_values = {
-                ':result_data': {'S': result_s3_path},
+                ':result_data': {'S': f"{result_s3_path}"},
                 ':timestamp': {'S': timestamp}
             }
 
@@ -638,10 +665,45 @@ class DynamoDBTracker:
                 ExpressionAttributeValues=expression_attribute_values
             )
 
+            self.dynamodb.update_item(
+                TableName=self.project_config_table_name,
+                Key={'project_name': {'S': project_name}},
+                UpdateExpression="SET #result_path = :result_path, #latest_request_id = :latest_request_id",
+                ExpressionAttributeNames={
+                    '#result_path': 'result_path',
+                    '#latest_request_id': 'latest_request_id'
+                },
+                ExpressionAttributeValues={
+                    ':result_path': {'S': f"{result_s3_path}"},
+                    ':latest_request_id': {'S': request_id}
+                }
+            )
+
+            combined_item = combined_result.to_dynamodb_dict(
+                f"combined_{request_id}", project_id)
+            combined_item['request_id'] = {'S': f"combined_{request_id}"}
+            step_item = step_result.to_dynamodb_dict(request_id, project_id)
+
+            # Create new project result
+            self.dynamodb.put_item(
+                TableName=self.project_result_table_name,
+                Item=combined_item
+            )
+            self.dynamodb.put_item(
+                TableName=self.project_result_table_name,
+                Item=step_item
+            )
+
             logger.info(
                 f"✅ Project result data updated: {project_id} - {result_s3_path}")
             return True
         except Exception as e:
+            logger.info(f"project name: {project_name}")
+            logger.info(f"project id: {project_id}")
+            logger.info(f"result s3 path: {result_s3_path}")
+            logger.info(
+                f"result s3 path combined result: {result_s3_path}/combined_result.json")
+
             logger.error(f"❌ Failed to update project result data: {e}")
             return False
 

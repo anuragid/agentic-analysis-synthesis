@@ -3,9 +3,11 @@ Hybrid Agentic Design Analysis Implementation
 Combines LangChain/LangGraph orchestration with OpenAI's native agentic framework
 """
 
+from datetime import datetime, timezone
 import os
 import json
 import logging
+import time
 from typing import Dict, List, Any, TypedDict, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -23,8 +25,8 @@ from s3_storage import create_s3_storage
 logger = logging.getLogger(__name__)
 
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
-S3_PREFIX = os.getenv("S3_PREFIX", "design-analysis")
+S3_REGION = os.getenv("S3_REGION", "us-east-2")
+S3_PREFIX = os.getenv("S3_PREFIX", "aas")
 
 # Import DynamoDB tracker
 try:
@@ -74,11 +76,151 @@ storage = initialize_storage()
 # State definition for LangGraph
 
 
+class Chunk(BaseModel):
+    id: str
+    content: str
+    source: str
+    type: str
+    confidence: float
+    tags: List[str]
+
+
+class Inference(BaseModel):
+    chunk_id: str
+    meanings: List[str]
+    importance: str
+    context: str
+    confidence: float
+    reasoning: str
+
+
+class Pattern(BaseModel):
+    name: str
+    description: str
+    related_inferences: List[str]
+    themes: List[str]
+    strength: float
+    evidence_count: int
+
+
+class Insight(BaseModel):
+    headline: str
+    explanation: str
+    pattern_id: str
+    non_consensus: bool
+    first_principles: bool
+    impact_score: float
+    supporting_evidence: List[str]
+
+
+class DesignPrinciple(BaseModel):
+    principle: str
+    insight_id: str
+    action_verbs: List[str]
+    design_direction: str
+    priority: float
+    feasibility: float
+
+
+class Metadata(BaseModel):
+    request_id: str
+    framework: str
+    model: str
+    orchestration: str
+    function_calling: str
+    research_data_s3_path: str
+
+
+class HybridAnalysisResponse(BaseModel):
+    request_id: str
+    status: str
+    implementation: str
+    timestamp: str
+    chunks: List[Chunk]
+    inferences: List[Inference]
+    patterns: List[Pattern]
+    insights: List[Insight]
+    design_principles: List[DesignPrinciple]
+    metadata: Optional[Metadata] = None
+    execution_time: float
+
+    def to_dynamodb_dict(self, request_id: str, project_id: str) -> Dict[str, Any]:
+        return {
+            'status': {'S': self.status},
+            'implementation': {'S': self.implementation},
+            'timestamp': {'S': self.timestamp},
+            'request_id': {'S': request_id},
+            'project_id': {'S': project_id},
+            'chunks': {'L': [{
+                'M': {
+                    'id': {'S': chunk.id},
+                    'content': {'S': chunk.content},
+                    'source': {'S': chunk.source},
+                    'type': {'S': chunk.type},
+                    'confidence': {'N': str(chunk.confidence)},
+                    'tags': {'L': [{'S': tag} for tag in chunk.tags]}
+                }
+            } for chunk in self.chunks]},
+            'inferences': {'L': [{
+                'M': {
+                    'chunk_id': {'S': inference.chunk_id},
+                    'meanings': {'L': [{'S': meaning} for meaning in inference.meanings]},
+                    'importance': {'S': inference.importance},
+                    'context': {'S': inference.context},
+                    'confidence': {'N': str(inference.confidence)},
+                    'reasoning': {'S': inference.reasoning}
+                }
+            } for inference in self.inferences]},
+            'patterns': {'L': [{
+                'M': {
+                    'name': {'S': pattern.name},
+                    'description': {'S': pattern.description},
+                    'related_inferences': {'L': [{'S': inference_id} for inference_id in pattern.related_inferences]},
+                    'themes': {'L': [{'S': theme} for theme in pattern.themes]},
+                    'strength': {'N': str(pattern.strength)},
+                    'evidence_count': {'N': str(pattern.evidence_count)}
+                }
+            } for pattern in self.patterns]},
+            'insights': {'L': [{
+                'M': {
+                    'headline': {'S': insight.headline},
+                    'explanation': {'S': insight.explanation},
+                    'pattern_id': {'S': insight.pattern_id},
+                    'non_consensus': {'BOOL': insight.non_consensus},
+                    'first_principles': {'BOOL': insight.first_principles},
+                    'impact_score': {'N': str(insight.impact_score)},
+                    'supporting_evidence': {'L': [{'S': evidence} for evidence in insight.supporting_evidence]}
+                }
+            } for insight in self.insights]},
+            'design_principles': {'L': [{
+                'M': {
+                    'principle': {'S': design_principle.principle},
+                    'insight_id': {'S': design_principle.insight_id},
+                    'action_verbs': {'L': [{'S': action_verb} for action_verb in design_principle.action_verbs]},
+                    'design_direction': {'S': design_principle.design_direction},
+                    'priority': {'N': str(design_principle.priority)},
+                    'feasibility': {'N': str(design_principle.feasibility)}
+                }
+            } for design_principle in self.design_principles]},
+
+            'metadata': {'M': {
+                'request_id': {'S': self.metadata.request_id if self.metadata else ''},
+                'framework': {'S': self.metadata.framework if self.metadata else ''},
+                'model': {'S': self.metadata.model if self.metadata else ''},
+                'orchestration': {'S': self.metadata.orchestration if self.metadata else ''},
+                'function_calling': {'S': self.metadata.function_calling if self.metadata else ''},
+                'research_data_s3_path': {'S': self.metadata.research_data_s3_path if self.metadata else ''}
+            }},
+            'execution_time': {'N': str(self.execution_time)}
+        }
+
+
 class ProjectConfig(BaseModel):
     project_name: str = Field(description="Project name")
     project_id: str = Field(description="Project ID")
-    # s3://aas/projects/<project_id>/<latest_result_id>.json
+    # s3://aas/projects/<project_id>/<result_id>.json
     result_path: str = Field(description="Project Result path")
+    latest_request_id: str = Field(description="Latest request ID")
 
 
 class InputConfig(BaseModel):
@@ -90,7 +232,7 @@ class DesignAnalysisState(TypedDict):
     tracker: DynamoDBTracker
     input_config: InputConfig
     project_config: ProjectConfig
-    project_result: Optional[dict] = Field(
+    project_result: Optional[HybridAnalysisResponse] = Field(
         description="Project's result")
     combine_phase: bool = Field(description="Combine phase", default=False)
     research_data: str
@@ -299,31 +441,8 @@ def get_design_principle_functions():
 
 def chunk_research_data(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 1: Break research data into chunks using LangChain output parser"""
-    project_id = state.get('project_config', {}).get('project_id')
-    # check if combine
-    is_combine_phase = state.get('combine_phase', False)
-    if is_combine_phase:
-        latest_project_result = state.get('latest_project_result')
-        if latest_project_result:
-            if tracker and request_id:
-                tracker.update_project_step_status(
-                    project_id=project_id,
-                    request_id=request_id,
-                    step_name="chunking",
-                    status=StepStatus.COMPLETED,
-                    message=f"Successfully created {len(latest_project_result.get('chunks', [])) + len(state.get('chunks', []))} chunks using latest project result and current chunks",
-                )
-            return {
-                **state,
-                "chunks": [
-                    *[chunk for chunk in latest_project_result.get('chunks', [])],
-                    *[chunk for chunk in state.get('chunks', [])]
-                ],
-                "current_step": "chunking",
-                "messages": state["messages"] + [AIMessage(content=f"Created {len(latest_project_result.get('chunks', [])) + len(state.get('chunks', []))} chunks using latest project result and current chunks")]
-            }
-        return state
-
+    project_id = state.get('project_config').project_id
+    request_id = state.get('analysis_metadata', {}).get('request_id')
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
@@ -404,7 +523,7 @@ Return a JSON array of chunks."""
             else:
                 # Dict format
                 chunk_dict = {
-                    "id": chunk.get('id', f"chunk_{uuid.uuid4().hex[:8]}"),
+                    "id": f"{request_id}-{chunk.get('id', f"chunk_{uuid.uuid4().hex[:8]}")}",
                     "content": chunk.get('content', str(chunk)),
                     "source": chunk.get('source', 'research_data'),
                     "type": chunk.get('type', 'observation'),
@@ -426,7 +545,7 @@ Return a JSON array of chunks."""
                 request_id=request_id,
                 step_name="chunking",
                 status=StepStatus.COMPLETED,
-                message=f"Created {len(chunks)} chunks using fallback method",
+                message=f"Created {len(chunks)} chunks",
             )
     except Exception as e:
         # Fallback to rule-based chunking if parsing fails
@@ -440,7 +559,7 @@ Return a JSON array of chunks."""
             tags = ["user_feedback"] if "user" in line.lower() else ["general"]
 
             chunks.append({
-                "id": f"chunk_{uuid.uuid4().hex[:8]}",
+                "id": f"{request_id}-chunk_{uuid.uuid4().hex[:8]}",
                 "content": line,
                 "source": "research_data",
                 "type": chunk_type,
@@ -472,30 +591,8 @@ Return a JSON array of chunks."""
 
 def infer_meanings(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 2: Interpret chunks and extract meanings using LangChain output parser"""
-    project_id = state.get('project_config', {}).get('project_id')
-    # check if combine
-    is_combine_phase = state.get('combine_phase', False)
-    if is_combine_phase:
-        latest_project_result = state.get('latest_project_result')
-        if latest_project_result:
-            if tracker and request_id:
-                tracker.update_project_step_status(
-                    project_id=project_id,
-                    request_id=request_id,
-                    step_name="inferring",
-                    status=StepStatus.COMPLETED,
-                    message=f"Successfully created {len(latest_project_result.get('inferences', [])) + len(state.get('inferences', []))} inferences using latest project result and current inferences",
-                )
-            return {
-                **state,
-                "inferences": [
-                    *[inference for inference in latest_project_result.get('inferences', [])],
-                    *[inference for inference in state.get('inferences', [])]
-                ],
-                "current_step": "inferring",
-                "messages": state["messages"] + [AIMessage(content=f"Created {len(latest_project_result.get('inferences', []))} inferences using latest project result")]
-            }
-        return state
+    project_id = state.get('project_config').project_id
+    request_id = state.get('analysis_metadata', {}).get('request_id')
 
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
@@ -530,7 +627,7 @@ Focus on thoughtful, logical interpretations in your own words.
 Return a JSON array of inferences."""
 
     chunks_text = "\n\n".join([
-        f"Chunk {chunk['id']}: {chunk['content']}"
+        f"Chunk {chunk.get('id')}: {chunk.get('content')}"
         for chunk in state['chunks']
     ])
 
@@ -573,7 +670,9 @@ Return a JSON array of inferences."""
         print(f"Parsing failed, using fallback: {e}")
         inferences = []
         for chunk in state['chunks']:
-            content = chunk['content'].lower()
+            # Handle both dict and Pydantic objects
+            content = str(chunk.get('content') or '').lower()
+            chunk_id = chunk.get('id') or ''
 
             meanings = []
             if "quick" in content or "fast" in content:
@@ -587,7 +686,7 @@ Return a JSON array of inferences."""
                 meanings.append("Users have specific needs and preferences")
 
             inferences.append({
-                "chunk_id": chunk['id'],
+                "chunk_id": chunk_id,
                 "meanings": meanings,
                 "importance": "Reveals user behavior patterns and needs",
                 "context": "Indicates fundamental user preferences",
@@ -618,9 +717,10 @@ Return a JSON array of inferences."""
 
 def relate_patterns(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 3: Find patterns across meanings using LangChain output parser"""
-    project_id = state.get('project_config', {}).get('project_id')
+    project_id = state.get('project_config').project_id
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
+    project_result = state.get('project_result')
     if tracker and request_id:
         tracker.update_step_status(
             request_id, "relating", StepStatus.PROCESSING,
@@ -635,6 +735,17 @@ def relate_patterns(state: DesignAnalysisState) -> DesignAnalysisState:
         )
 
     # Create output parser for patterns
+    logger.info(
+        f"[aas-logger] (relating) latest project result chunks: {len(project_result.chunks if project_result else [])}")
+    logger.info(
+        f"[aas-logger] (relating) latest project result inferences: {len(project_result.inferences if project_result else [])}")
+    logger.info(
+        f"[aas-logger] (relating) current inferences: {len(state.get('inferences', []))}")
+    logger.info(
+        f"[aas-logger] (relating) current chunks: {len(state.get('chunks', []))}")
+    logger.info(
+        f"[aas-logger] (relating) current patterns: {state.get('patterns')}")
+
     pattern_parser = JsonOutputParser(pydantic_object=Pattern)
 
     system_prompt = """You are an expert at identifying patterns and relationships in research data.
@@ -653,7 +764,7 @@ Return a JSON array of patterns."""
 
     inferences_text = "\n\n".join([
         f"Inference {inf['chunk_id']}: {', '.join(inf['meanings'])}"
-        for inf in state['inferences']
+        for inf in state.get('inferences', [])
     ])
 
     messages = [
@@ -697,11 +808,15 @@ Return a JSON array of patterns."""
         clarity_inferences = []
 
         for inference in state['inferences']:
-            meanings_text = ' '.join(inference['meanings']).lower()
+            # Handle both dict and Pydantic objects
+            meanings = inference.get('meanings') or []
+            chunk_id = inference.get('chunk_id') or ''
+
+            meanings_text = ' '.join(str(m) for m in meanings).lower()
             if any(word in meanings_text for word in ['speed', 'efficient', 'quick', 'fast']):
-                efficiency_inferences.append(inference['chunk_id'])
+                efficiency_inferences.append(chunk_id)
             if any(word in meanings_text for word in ['complex', 'cluttered', 'simple', 'clear']):
-                clarity_inferences.append(inference['chunk_id'])
+                clarity_inferences.append(chunk_id)
 
         patterns = []
         if efficiency_inferences:
@@ -737,6 +852,12 @@ Return a JSON array of patterns."""
                 status=StepStatus.COMPLETED,
                 message=f"Identified {len(patterns)} patterns using fallback method",
             )
+
+    logger.info(
+        f"[aas-logger] (relating) new patterns count: {len(patterns)}")
+    logger.info(
+        f"[aas-logger] (relating) new patterns: {patterns}")
+
     return {
         **state,
         "patterns": patterns,
@@ -747,7 +868,7 @@ Return a JSON array of patterns."""
 
 def explain_insights(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 4: Generate insights from patterns using LangChain output parser"""
-    project_id = state.get('project_config', {}).get('project_id')
+    project_id = state.get('project_config').project_id
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
@@ -869,7 +990,7 @@ Return a JSON array of insights."""
 
 def activate_design_principles(state: DesignAnalysisState) -> DesignAnalysisState:
     """Node 5: Convert insights into design principles using LangChain output parser"""
-    project_id = state.get('project_config', {}).get('project_id')
+    project_id = state.get('project_config').project_id
     # Update DynamoDB status to processing
     request_id = state.get('analysis_metadata', {}).get('request_id')
     if tracker and request_id:
@@ -1012,6 +1133,26 @@ def create_hybrid_agentic_graph():
     return workflow.compile()
 
 
+def create_combined_agentic_graph():
+    """Create the combined agentic design analysis workflow using LangGraph"""
+
+    # Create the graph
+    workflow = StateGraph(DesignAnalysisState)
+
+    # Add nodes (each using OpenAI function calling internally)
+    workflow.add_node("relate", relate_patterns)
+    workflow.add_node("explain", explain_insights)
+    workflow.add_node("activate", activate_design_principles)
+
+    # Define the flow
+    workflow.set_entry_point("relate")
+    workflow.add_edge("relate", "explain")
+    workflow.add_edge("explain", "activate")
+    workflow.add_edge("activate", END)
+
+    return workflow.compile()
+
+
 def initialize_project_config_in_graph(tracker: DynamoDBTracker, project_name: str) -> ProjectConfig:
 
     # query dynamo db for project config by project name
@@ -1023,6 +1164,28 @@ def initialize_project_config_in_graph(tracker: DynamoDBTracker, project_name: s
         project_config = tracker.get_project_config_by_name(project_name)
 
     return ProjectConfig(**project_config)
+
+
+def _get_inference_field(inference: Any, field: str) -> Any:
+    """Safely get a field from an inference, handling both dict and Pydantic objects"""
+    if isinstance(inference, dict):
+        return inference.get(field)
+    elif hasattr(inference, field):
+        return getattr(inference, field)
+    elif hasattr(inference, 'model_dump'):
+        return inference.model_dump().get(field)
+    return None
+
+
+def _get_chunk_field(chunk: Any, field: str) -> Any:
+    """Safely get a field from a chunk, handling both dict and Pydantic objects"""
+    if isinstance(chunk, dict):
+        return chunk.get(field)
+    elif hasattr(chunk, field):
+        return getattr(chunk, field)
+    elif hasattr(chunk, 'model_dump'):
+        return chunk.model_dump().get(field)
+    return None
 
 
 def run_hybrid_agentic_analysis(
@@ -1080,31 +1243,103 @@ def run_hybrid_agentic_analysis(
     }
 
     # Run the workflow
+    start_time = time.time()
+
     result = graph.invoke(initial_state)
-    combined_result = result
+    combined_result = {**result}
 
     # invoke with combined
-    if project_config.result_path:
-        project_result = storage.get_project_result(
-            project_config.result_path)
+    if project_config.latest_request_id:
+        project_result = tracker.get_project_result_by_request_id(
+            f"combined_{project_config.latest_request_id}")
         if project_result:
+            logger.info(f"Project result: {project_result}")
+            project_result = HybridAnalysisResponse(**project_result)
+            logger.info(
+                f"[aas-logger] (combined) project result chunks: {len(project_result.chunks)}")
+            logger.info(
+                f"[aas-logger] (combined) project result inferences: {len(project_result.inferences)}")
+            logger.info(
+                f"[aas-logger] (combined) initial state chunks: {len(initial_state['chunks'])}")
+            logger.info(
+                f"[aas-logger] (combined) initial state inferences: {len(initial_state['inferences'])}")
+
             initial_state['combine_phase'] = True
+            # Convert Pydantic objects to dictionaries for state compatibility
+            initial_state['chunks'] = [
+                *[chunk.model_dump() for chunk in project_result.chunks],
+                *[chunk for chunk in result.get('chunks', [])]
+            ]
+            initial_state['inferences'] = [
+                *[inference.model_dump()
+                  for inference in project_result.inferences],
+                *[inference for inference in result.get('inferences', [])]
+            ]
+
             initial_state['project_result'] = project_result
-            combined_result = graph.invoke(initial_state)
+            logger.info(
+                f"[aas-logger] (combined) initial state chunks: {len(initial_state['chunks'])}")
+            logger.info(
+                f"[aas-logger] (combined) initial state inferences: {len(initial_state['inferences'])}")
+            combined_graph = create_combined_agentic_graph()
+            combined_result = combined_graph.invoke(initial_state)
         else:
             logger.error(
                 f"❌ Failed to get project result from S3: {project_config.result_path}")
             return None
+    execution_time = time.time() - start_time
 
     # Save result to S3 and update DynamoDB result_data field
     if tracker and request_id and save_to_s3:
         try:
             # Save result to S3
+            logger.info("saving project result to s3")
+            logger.info(f"combined result: {combined_result}")
+            if project_config.result_path:
+                result_path = project_config.result_path
+            else:
+                result_path = f"projects/{project_config.project_id}"
+            # remove tracker from result and combined result
+            result = HybridAnalysisResponse(
+                request_id=request_id,
+                status="completed",
+                implementation="hybrid",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                chunks=result.get("chunks", []),
+                inferences=result.get("inferences", []),
+                patterns=result.get("patterns", []),
+                insights=result.get("insights", []),
+                design_principles=result.get("design_principles", []),
+                metadata=result.get("analysis_metadata"),
+                execution_time=execution_time
+            )
+            combined_result = HybridAnalysisResponse(
+                request_id=request_id,
+                status="completed",
+                implementation="hybrid",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                chunks=combined_result.get("chunks", []),
+                inferences=combined_result.get("inferences", []),
+                patterns=combined_result.get("patterns", []),
+                insights=combined_result.get("insights", []),
+                design_principles=combined_result.get("design_principles", []),
+                metadata=combined_result.get("analysis_metadata"),
+                execution_time=execution_time
+            )
             success = storage.save_project_result(
-                request_id, project_config.result_path, result, combined_result)
+                request_id, result_path, result.model_dump(), combined_result.model_dump(),
+            )
+            tracker.update_project_result_data(
+                request_id=request_id,
+                project_id=project_config.project_id,
+                project_name=project_config.project_name,
+                result_s3_path=result_path,
+                step_result=result,
+                combined_result=combined_result
+            )
             if success:
                 logger.info(
-                    f"✅ Project result saved to S3: {project_config.result_path}")
+                    f"✅ Project result saved to S3: {result_path}")
             else:
                 logger.error(f"❌ Failed to save project result to S3")
         except Exception as e:

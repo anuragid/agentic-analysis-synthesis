@@ -6,8 +6,8 @@ FastAPI application with configurable storage (local or S3) and DynamoDB trackin
 
 from dynamodb_tracker import StepStatus
 from s3_storage import create_s3_storage, S3Storage
-from agentic_analysis import ProjectConfig, run_agentic_analysis
-from hybrid_agentic_analysis import run_hybrid_agentic_analysis
+from agentic_analysis import run_agentic_analysis
+from hybrid_agentic_analysis import ProjectConfig, run_hybrid_agentic_analysis
 from openai_agentic_analysis import run_openai_agentic_analysis
 
 # Import DynamoDB tracker
@@ -687,7 +687,7 @@ async def run_analysis_async(request_id: str, research_data: str, implementation
             logger.info(
                 f"🔄 Running hybrid agentic analysis for request {request_id}")
             result = run_hybrid_agentic_analysis(
-                research_data, request_id, research_data_s3_path, save_to_s3=True)
+                research_data, project_config.project_name, request_id, research_data_s3_path, save_to_s3=True)
         else:  # langchain
             logger.info(
                 f"🔗 Running LangChain agentic analysis for request {request_id}")
@@ -699,47 +699,33 @@ async def run_analysis_async(request_id: str, research_data: str, implementation
 
         # Prepare response
         logger.info(f"📋 Preparing response for request {request_id}")
-        response = AnalysisResponse(
-            request_id=request_id,
-            status="completed",
-            implementation=implementation,
-            timestamp=datetime.now().isoformat(),
-            chunks=result.get("chunks", []),
-            inferences=result.get("inferences", []),
-            patterns=result.get("patterns", []),
-            insights=result.get("insights", []),
-            design_principles=result.get("design_principles", []),
-            metadata=result.get(
-                "analysis_metadata") if include_metadata else None,
-            execution_time=execution_time
-        )
 
         # Store result
         logger.info(f"💾 Storing analysis result for request {request_id}")
-        storage_success = storage.save_analysis(request_id, response.dict())
-        if storage_success:
-            logger.info(
-                f"✅ Analysis result stored successfully for request {request_id}")
+        # storage_success = storage.save_analysis(request_id, response.dict())
+        # if storage_success:
+        #     logger.info(
+        #         f"✅ Analysis result stored successfully for request {request_id}")
 
-            # Update DynamoDB with the result S3 path if using hybrid implementation
-            if implementation == "hybrid" and tracker and request_id:
-                try:
-                    # Get the actual S3 path where the result was stored using storage system
-                    result_s3_path = storage._get_object_key(
-                        request_id, "analysis")
+        #     # Update DynamoDB with the result S3 path if using hybrid implementation
+        #     if implementation == "hybrid" and tracker and request_id:
+        #         try:
+        #             # Get the actual S3 path where the result was stored using storage system
+        #             result_s3_path = storage._get_object_key(
+        #                 request_id, "analysis")
 
-                    # Update DynamoDB with the result S3 path (only the result_data field)
-                    tracker.update_result_data(request_id, result_s3_path)
-                    tracker.update_project_result_data(
-                        project_config.project_id, project_config.latest_result_path)
-                    logger.info(
-                        f"✅ DynamoDB updated with result S3 path: {result_s3_path}")
-                except Exception as e:
-                    logger.error(
-                        f"❌ Failed to update DynamoDB with result S3 path: {e}")
-        else:
-            logger.warning(
-                f"⚠️ Failed to store analysis result for request {request_id}")
+        #             # Update DynamoDB with the result S3 path (only the result_data field)
+        #             tracker.update_result_data(request_id, result_s3_path)
+        #             tracker.update_project_result_data(
+        #                 project_config.project_id, project_config.latest_result_path)
+        #             logger.info(
+        #                 f"✅ DynamoDB updated with result S3 path: {result_s3_path}")
+        #         except Exception as e:
+        #             logger.error(
+        #                 f"❌ Failed to update DynamoDB with result S3 path: {e}")
+        # else:
+        #     logger.warning(
+        #         f"⚠️ Failed to store analysis result for request {request_id}")
 
         logger.info(f"🎉 Analysis request {request_id} completed successfully")
 

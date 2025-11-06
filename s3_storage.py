@@ -252,7 +252,7 @@ class S3Storage:
             # Upload to S3
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
-                Key=object_key,
+                Key=f"request_results/{request_id}.json",
                 Body=json_data,
                 ContentType='application/json',
                 Metadata={
